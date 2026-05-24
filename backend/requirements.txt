@@ -1,0 +1,38 @@
+# ParkSmart AI — Backend Dependencies
+# Install: pip install -r requirements.txt
+
+# ── Web Framework ─────────────────────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+gunicorn==22.0.0
+python-multipart==0.0.9
+
+# ── Firebase ──────────────────────────────────────────────────────────────────
+firebase-admin==6.5.0
+google-cloud-firestore==2.16.0
+
+# ── Config & Environment ──────────────────────────────────────────────────────
+python-dotenv==1.0.1
+pydantic[email]==2.7.1
+pydantic-settings==2.2.1
+
+# ── Scheduling (overtime scanner) ────────────────────────────────────────────
+apscheduler==3.10.4
+
+# ── QR Code generation ────────────────────────────────────────────────────────
+qrcode[pil]==7.4.2
+Pillow==10.3.0
+
+# ── Email / Notifications (placeholder) ─────────────────────────────────────
+httpx==0.27.0
+
+# ── AI / ML (Phase 2 — install when needed) ──────────────────────────────────
+# tensorflow==2.16.1
+# numpy==1.26.4
+# pandas==2.2.2
+# scikit-learn==1.4.2
+
+# ── Dev tools ────────────────────────────────────────────────────────────────
+pytest==8.2.0
+pytest-asyncio==0.23.6
+httpx==0.27.0
