@@ -46,9 +46,9 @@ async def scan_overtime(admin: dict = Depends(require_admin)):
 
     Intended to be called by Cloud Scheduler every 5 minutes.
     """
-    db    = get_db()
-    now   = datetime.utcnow()
-    today = now.strftime("%Y-%m-%d")
+    db       = get_db()
+    now      = datetime.utcnow()
+    today    = now.strftime("%Y-%m-%d")
     now_mins = now.hour * 60 + now.minute
 
     active_bookings = (
@@ -69,11 +69,17 @@ async def scan_overtime(admin: dict = Depends(require_admin)):
         overtime_mins = now_mins - end_mins
         penalty       = calc_penalty(overtime_mins)
 
-        # Update booking
+        # Update booking AND free up slot
         db.collection("bookings").document(b["bookingId"]).update({
-            "bookingStatus":  "overtime",
+            "bookingStatus":   "overtime",
+            "qrStatus":        "expired",
             "overtimeMinutes": overtime_mins,
-            "penaltyAmount":  penalty["amount"],
+            "penaltyAmount":   penalty["amount"],
+        })
+
+        # Mark slot as available again
+        db.collection("parking_slots").document(b["slotId"]).update({
+            "status": "vacant"
         })
 
         # Create penalty record
@@ -103,7 +109,7 @@ def _handle_overstay_conflict(db, overstaying_booking: dict, now_mins: int):
     If the overstaying vehicle's slot has a NEXT booking that starts within
     BUFFER_MINS, attempt auto-reassignment for the next user.
     """
-    today = overstaying_booking["bookingDate"]
+    today   = overstaying_booking["bookingDate"]
     slot_id = overstaying_booking["slotId"]
 
     next_bookings = (

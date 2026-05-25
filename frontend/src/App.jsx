@@ -1,8 +1,10 @@
 // src/App.jsx
-import React from "react";
+import React, { useEffect } from "react";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider, useAuth } from "./context/AuthContext.jsx";
 import { BookingProvider } from "./context/BookingContext.jsx";
+import { checkAndExpireSlots } from "./utils/index.js";
+import { db } from "./services/firebase.js";
 
 // Auth pages
 import Landing from "./pages/Landing.jsx";
@@ -71,6 +73,20 @@ function AppRoutes() {
 }
 
 export default function App() {
+  // Auto-expire slots every minute
+  useEffect(() => {
+    // Run immediately on app load
+    checkAndExpireSlots(db);
+
+    // Then check every minute
+    const interval = setInterval(() => {
+      checkAndExpireSlots(db);
+    }, 60000); // 60000ms = 1 minute
+
+    // Cleanup interval on unmount
+    return () => clearInterval(interval);
+  }, []);
+
   return (
     <AuthProvider>
       <BrowserRouter>

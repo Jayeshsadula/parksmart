@@ -1,0 +1,7 @@
+# Create .gitignore to exclude node_modules, env files etc.
+echo "node_modules/
+dist/
+.env
+.env.local
+.firebase/
+firebase-debug.log" > .gitignore

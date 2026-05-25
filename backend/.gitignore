@@ -1,0 +1,11 @@
+cd C:\Users\JAYESH SADULA\OneDrive\Attachments\Desktop\parksmart-ai\backend
+
+@"
+venv/
+__pycache__/
+*.pyc
+.env
+serviceAccountKey.json
+"@ | Out-File -FilePath ".gitignore" -Encoding UTF8
+
+echo "Backend .gitignore created"

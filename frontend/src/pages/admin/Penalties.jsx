@@ -2,7 +2,7 @@
 import React, { useEffect, useState } from "react";
 import Sidebar from "../../components/shared/Sidebar.jsx";
 import useToast from "../../hooks/useToast.jsx";
-import { getPendingPenalties, resolvePenalty, createPenalty } from "../../services/firestoreService.js";
+import { getPendingPenalties, resolvePenalty, scanOvertimeBookings } from "../../services/firestoreService.js";
 import { calcPenalty } from "../../utils/index.js";
 import { motion } from "framer-motion";
 
@@ -23,11 +23,10 @@ const POLICY = [
   { range: "60+ min",   action: "Max penalty + auto-reassign check", amount: 200, color: "#dc2626" },
 ];
 
-// Simulated sample penalties (until Firestore has real data)
 const SAMPLE_PENALTIES = [
-  { penaltyId: "P001", bookingId: "BK001", userId: "TS07CD5678", slot: "A3", area: "CityMall Parking",    overtimeMins: 42, status: "pending" },
-  { penaltyId: "P002", bookingId: "BK002", userId: "AP28EF9012", slot: "B7", area: "RGIA Airport",        overtimeMins: 18, status: "pending" },
-  { penaltyId: "P003", bookingId: "BK003", userId: "TS09AB1234", slot: "C2", area: "Hitech Office Hub",   overtimeMins: 8,  status: "warning" },
+  { penaltyId: "P001", bookingId: "BK001", userId: "TS07CD5678", slot: "A3", area: "CityMall Parking",  overtimeMins: 42, status: "pending" },
+  { penaltyId: "P002", bookingId: "BK002", userId: "AP28EF9012", slot: "B7", area: "RGIA Airport",      overtimeMins: 18, status: "pending" },
+  { penaltyId: "P003", bookingId: "BK003", userId: "TS09AB1234", slot: "C2", area: "Hitech Office Hub", overtimeMins: 8,  status: "warning" },
 ];
 
 export default function Penalties() {
@@ -36,9 +35,22 @@ export default function Penalties() {
   const [loading,   setLoading]   = useState(false);
 
   useEffect(() => {
-    getPendingPenalties()
-      .then((data) => { if (data.length > 0) setPenalties(data); })
-      .catch(() => {});
+    const loadPenalties = async () => {
+      try {
+        // First scan for new overtime bookings
+        await scanOvertimeBookings();
+
+        // Then load all pending penalties
+        const data = await getPendingPenalties();
+        if (data.length > 0) {
+          setPenalties(data);
+        }
+      } catch (err) {
+        console.error("Error loading penalties:", err);
+      }
+    };
+
+    loadPenalties();
   }, []);
 
   const handleResolve = async (penaltyId, action) => {

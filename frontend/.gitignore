@@ -1,1 +1,11 @@
-node_modules
+cd C:\Users\JAYESH SADULA\OneDrive\Attachments\Desktop\parksmart-ai\frontend
+
+@"
+node_modules/
+dist/
+.env
+.env.local
+.env.production
+"@ | Out-File -FilePath ".gitignore" -Encoding UTF8
+
+echo "Frontend .gitignore created"

@@ -1,11 +1,9 @@
 // src/services/firestoreService.js
-// All Firestore read/write operations. Swap mock DB for real Firebase calls here.
-
 import {
-  collection, doc, getDoc, getDocs, setDoc, updateDoc,
-  query, where, runTransaction, serverTimestamp, onSnapshot, orderBy, limit,
+  collection, doc, getDoc, getDocs, setDoc, updateDoc, addDoc,
+  query, where, runTransaction, serverTimestamp, onSnapshot, limit,
 } from "firebase/firestore";
-import { db } from "./firebase";
+import { db } from "./firebase.js";
 
 // ── Users ──────────────────────────────────────────────────────────────────
 export const createUser = async (uid, data) => {
@@ -88,14 +86,12 @@ export const subscribeToSlots = (floorId, callback) => {
 };
 
 // ── Bookings ───────────────────────────────────────────────────────────────
-
-/**
- * ATOMIC booking engine — prevents double booking.
- * Uses Firestore runTransaction to lock-check-write atomically.
- */
-export const createBooking = async ({ userId, slotId, parkingAreaId, bookingDate, startTime, endTime, ...meta }) => {
+export const createBooking = async ({
+  userId, slotId, parkingAreaId,
+  bookingDate, startTime, endTime, ...meta
+}) => {
   const bookingRef = doc(collection(db, "bookings"));
-  const slotRef = doc(db, "parking_slots", slotId);
+  const slotRef    = doc(db, "parking_slots", slotId);
 
   await runTransaction(db, async (tx) => {
     // 1. Re-read slot inside transaction
@@ -104,39 +100,38 @@ export const createBooking = async ({ userId, slotId, parkingAreaId, bookingDate
     const slot = slotSnap.data();
     if (slot.status !== "vacant") throw new Error("Slot is no longer available");
 
-    // 2. Check for time overlap among existing bookings for this slot
+    // 2. Check time overlap
     const existingQ = query(
       collection(db, "bookings"),
-      where("slotId", "==", slotId),
-      where("bookingDate", "==", bookingDate),
+      where("slotId",        "==", slotId),
+      where("bookingDate",   "==", bookingDate),
       where("bookingStatus", "in", ["active", "reserved"])
     );
-    // Note: getDocs inside transaction ensures consistent read
     const existingSnap = await getDocs(existingQ);
-    const newStart = timeToMins(startTime);
-    const newEnd = timeToMins(endTime);
+    const newStart    = timeToMins(startTime);
+    const newEnd      = timeToMins(endTime);
     const BUFFER_MINS = 15;
 
     for (const b of existingSnap.docs) {
-      const bd = b.data();
+      const bd     = b.data();
       const bStart = timeToMins(bd.startTime);
-      const bEnd = timeToMins(bd.endTime) + BUFFER_MINS;
+      const bEnd   = timeToMins(bd.endTime) + BUFFER_MINS;
       if (newStart < bEnd && newEnd > bStart) {
         throw new Error("Time slot overlaps with an existing booking (including 15-min buffer)");
       }
     }
 
-    // 3. Temporarily lock slot & write booking atomically
+    // 3. Atomic write
     tx.update(slotRef, { status: "reserved" });
     tx.set(bookingRef, {
       bookingId: bookingRef.id,
       userId, slotId, parkingAreaId, bookingDate, startTime, endTime,
       ...meta,
-      bookingStatus: "active",
-      qrStatus: "active",
-      penaltyAmount: 0,
+      bookingStatus:   "active",
+      qrStatus:        "active",
+      penaltyAmount:   0,
       overtimeMinutes: 0,
-      createdAt: serverTimestamp(),
+      createdAt:       serverTimestamp(),
     });
   });
 
@@ -145,13 +140,9 @@ export const createBooking = async ({ userId, slotId, parkingAreaId, bookingDate
 
 export const getBookingsByUser = async (userId) => {
   try {
-    const q = query(
-      collection(db, "bookings"),
-      where("userId", "==", userId)
-    );
+    const q    = query(collection(db, "bookings"), where("userId", "==", userId));
     const snap = await getDocs(q);
     const bookings = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    // Sort by createdAt descending
     return bookings.sort((a, b) => {
       if (!a.createdAt || !b.createdAt) return 0;
       const timeA = a.createdAt?.toDate?.() || new Date(a.createdAt);
@@ -165,113 +156,131 @@ export const getBookingsByUser = async (userId) => {
 };
 
 export const getAllBookings = async () => {
-  // Removed orderBy
-  const snap = await getDocs(query(collection(db, "bookings"), limit(200)));
-  const bookings = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-  return bookings.sort((a, b) => {
-    if (!a.createdAt || !b.createdAt) return 0;
-    return b.createdAt.toDate?.() - a.createdAt.toDate?.();
-  });
-};
-// Check if booking has expired based on date + time
-export const isBookingExpired = (booking) => {
-  const now = new Date();
-  const [year, month, day] = booking.bookingDate.split("-").map(Number);
-  const [hour, min] = booking.endTime.split(":").map(Number);
-  const endDateTime = new Date(year, month - 1, day, hour, min);
-  return now > endDateTime;
+  try {
+    const snap     = await getDocs(query(collection(db, "bookings"), limit(200)));
+    const bookings = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    return bookings.sort((a, b) => {
+      if (!a.createdAt || !b.createdAt) return 0;
+      const timeA = a.createdAt?.toDate?.() || new Date(a.createdAt);
+      const timeB = b.createdAt?.toDate?.() || new Date(b.createdAt);
+      return timeB - timeA;
+    });
+  } catch (err) {
+    console.error("getAllBookings error:", err);
+    return [];
+  }
 };
 
 export const updateBookingStatus = async (bookingId, updates) => {
   await updateDoc(doc(db, "bookings", bookingId), updates);
 };
 
+// ── QR Verification — ENTRY/EXIT toggle ───────────────────────────────────
 export const verifyQR = async (bookingId) => {
-  // Remove # prefix if present
   const cleanId = bookingId.replace("#", "").trim();
 
-  // Try direct document lookup first (document ID = booking ID)
-  let bookingRef = doc(db, "bookings", cleanId);
+  // Try direct document lookup first
+  let bookingRef  = doc(db, "bookings", cleanId);
   let bookingSnap = await getDoc(bookingRef);
 
   // If not found by doc ID, search by bookingId field
   if (!bookingSnap.exists()) {
-    const q = query(
-      collection(db, "bookings"),
-      where("bookingId", "==", cleanId)
-    );
+    const q    = query(collection(db, "bookings"), where("bookingId", "==", cleanId));
     const snap = await getDocs(q);
     if (snap.empty) throw new Error("Booking not found");
     bookingSnap = snap.docs[0];
-    bookingRef = snap.docs[0].ref;
+    bookingRef  = snap.docs[0].ref;
   }
 
   const booking = bookingSnap.data();
-
-  // Check booking is valid
   if (!booking) throw new Error("Booking not found");
   if (booking.bookingStatus === "cancelled") throw new Error("Booking is cancelled");
-  if (booking.qrStatus === "completed") throw new Error("QR already used for exit");
+  if (booking.qrStatus === "completed")      throw new Error("QR already used for exit");
 
-  // Time expiry check
   // Time expiry check with 15-minute grace period
-const now = new Date();
-const [year, month, day] = booking.bookingDate.split("-").map(Number);
-const [endHour, endMin] = booking.endTime.split(":").map(Number);
-const endDateTime = new Date(year, month - 1, day, endHour, endMin);
+  const now = new Date();
+  const [year, month, day] = booking.bookingDate.split("-").map(Number);
+  const [endHour, endMin]  = booking.endTime.split(":").map(Number);
+  const endDateTime        = new Date(year, month - 1, day, endHour, endMin);
+  const expiryDateTime     = new Date(endDateTime.getTime() + 15 * 60 * 1000);
 
-// Add 15-minute grace period after booking ends
-const gracePeriodMs = 15 * 60 * 1000; // 15 minutes
-const expiryDateTime = new Date(endDateTime.getTime() + gracePeriodMs);
-
-if (now > expiryDateTime && booking.qrStatus !== "used") {
-  throw new Error(
-    `QR expired. Booking ended at ${booking.endTime} (15-min grace period also passed)`
-  );
-}
+  if (now > expiryDateTime && booking.qrStatus !== "used") {
+    throw new Error(`QR expired. Booking ended at ${booking.endTime} (15-min grace period also passed)`);
+  }
 
   // Find the slot
-  const slotQuery = query(
-    collection(db, "parking_slots"),
-    where("slotId", "==", booking.slotId)
+  const slotSnap = await getDocs(
+    query(collection(db, "parking_slots"), where("slotId", "==", booking.slotId))
   );
-  const slotSnap = await getDocs(slotQuery);
 
-  // ENTRY scan (first scan - qrStatus is "active")
+  // ── ENTRY scan (first scan) ──────────────────────────────────────────────
   if (booking.qrStatus === "active") {
-    // Mark slot as OCCUPIED
     if (!slotSnap.empty) {
       await updateDoc(slotSnap.docs[0].ref, { status: "occupied" });
     }
-    // Update booking
     await updateDoc(bookingRef, {
-      qrStatus: "used",
+      qrStatus:      "used",
       bookingStatus: "occupied",
     });
-
     return {
       ...booking,
-      action: "ENTRY - Vehicle Entered Parking",
+      action:       "ENTRY - Vehicle Entered Parking",
       newSlotStatus: "occupied",
+      overtimeMins:  0,
+      penaltyAmount: 0,
+      tier:          "none",
     };
   }
 
-  // EXIT scan (second scan - qrStatus is "used")
+  // ── EXIT scan (second scan) ──────────────────────────────────────────────
   if (booking.qrStatus === "used") {
-    // Mark slot as VACANT
+    // Calculate overtime on exit
+    const overtimeMins = Math.max(0, Math.floor((now - endDateTime) / 60000));
+
+    let penaltyAmount = 0;
+    let tier          = "none";
+
+    if (overtimeMins > 60)      { penaltyAmount = 200; tier = "high";    }
+    else if (overtimeMins > 30) { penaltyAmount = 100; tier = "medium";  }
+    else if (overtimeMins > 15) { penaltyAmount = 50;  tier = "low";     }
+    else if (overtimeMins > 0)  { penaltyAmount = 0;   tier = "warning"; }
+
+    // Free slot
     if (!slotSnap.empty) {
       await updateDoc(slotSnap.docs[0].ref, { status: "vacant" });
     }
+
     // Update booking
     await updateDoc(bookingRef, {
-      qrStatus: "completed",
-      bookingStatus: "completed",
+      qrStatus:        "completed",
+      bookingStatus:   overtimeMins > 0 ? "overtime" : "completed",
+      overtimeMinutes: overtimeMins,
+      penaltyAmount:   penaltyAmount,
     });
+
+    // Create penalty record if overtime
+    if (overtimeMins > 0) {
+      await addDoc(collection(db, "penalties"), {
+        penaltyId:     `PEN-${Date.now()}`,
+        bookingId:     booking.bookingId || cleanId,
+        userId:        booking.userId,
+        slot:          booking.slotLabel,
+        area:          booking.parkingAreaName,
+        overtimeMins:  overtimeMins,
+        penaltyAmount: penaltyAmount,
+        tier:          tier,
+        status:        "pending",
+        createdAt:     new Date().toISOString(),
+      });
+    }
 
     return {
       ...booking,
-      action: "EXIT - Vehicle Left Parking",
+      action:        "EXIT - Vehicle Left Parking",
       newSlotStatus: "vacant",
+      overtimeMins,
+      penaltyAmount,
+      tier,
     };
   }
 
@@ -286,13 +295,138 @@ export const createPenalty = async (data) => {
 };
 
 export const getPendingPenalties = async () => {
-  const q = query(collection(db, "penalties"), where("status", "==", "pending"));
-  const snap = await getDocs(q);
-  return snap.docs.map((d) => d.data());
+  try {
+    const snap = await getDocs(
+      query(collection(db, "penalties"), where("status", "==", "pending"))
+    );
+    console.log("[PENALTIES] Found:", snap.docs.length);
+    return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  } catch (err) {
+    console.error("[PENALTIES] Error:", err);
+    return [];
+  }
 };
 
 export const resolvePenalty = async (penaltyId, action) => {
   await updateDoc(doc(db, "penalties", penaltyId), { status: action });
+};
+
+// ── Overtime Scanner ───────────────────────────────────────────────────────
+export const scanOvertimeBookings = async () => {
+  const now         = new Date();
+  const today       = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
+  const currentMins = now.getHours() * 60 + now.getMinutes();
+
+  console.log(`[OVERTIME] Scanning at ${now.toLocaleTimeString()} | Today: ${today}`);
+
+  try {
+    const snap = await getDocs(
+      query(
+        collection(db, "bookings"),
+        where("bookingDate", "==", today)
+      )
+    );
+
+    console.log(`[OVERTIME] Total bookings today: ${snap.docs.length}`);
+
+    for (const bookingDoc of snap.docs) {
+      const booking = bookingDoc.data();
+
+      if (["completed", "cancelled", "overtime"].includes(booking.bookingStatus)) continue;
+
+      const [endHour, endMin] = booking.endTime.split(":").map(Number);
+      const endMins           = endHour * 60 + endMin;
+      const overtimeMins      = currentMins - endMins;
+
+      if (overtimeMins > 0) {
+        let penaltyAmount = 0;
+        let tier          = "warning";
+
+        if (overtimeMins > 60)      { penaltyAmount = 200; tier = "high";    }
+        else if (overtimeMins > 30) { penaltyAmount = 100; tier = "medium";  }
+        else if (overtimeMins > 15) { penaltyAmount = 50;  tier = "low";     }
+
+        console.log(`[OVERTIME] ⚠ ${booking.bookingId} overtime ${overtimeMins}min → ₹${penaltyAmount}`);
+
+        await updateDoc(bookingDoc.ref, {
+          bookingStatus:   "overtime",
+          overtimeMinutes: overtimeMins,
+          penaltyAmount:   penaltyAmount,
+        });
+
+        // Check for duplicate penalty
+        const existing = await getDocs(
+          query(collection(db, "penalties"), where("bookingId", "==", booking.bookingId || bookingDoc.id))
+        );
+
+        if (existing.empty) {
+          await addDoc(collection(db, "penalties"), {
+            penaltyId:     `PEN-${Date.now()}`,
+            bookingId:     booking.bookingId || bookingDoc.id,
+            userId:        booking.userId,
+            slot:          booking.slotLabel,
+            area:          booking.parkingAreaName,
+            overtimeMins:  overtimeMins,
+            penaltyAmount: penaltyAmount,
+            tier:          tier,
+            status:        "pending",
+            createdAt:     new Date().toISOString(),
+          });
+        } else {
+          await updateDoc(existing.docs[0].ref, { overtimeMins, penaltyAmount, tier });
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[OVERTIME] Error:", err);
+  }
+};
+
+// ── Auto Expire Slots ──────────────────────────────────────────────────────
+export const checkAndExpireSlots = async () => {
+  try {
+    const now         = new Date();
+    const today       = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
+    const currentMins = now.getHours() * 60 + now.getMinutes();
+
+    console.log(`[AUTO-EXPIRE] Checking at ${now.getHours()}:${String(now.getMinutes()).padStart(2,"0")}`);
+
+    const snap = await getDocs(
+      query(
+        collection(db, "bookings"),
+        where("bookingDate",   "==", today),
+        where("bookingStatus", "in", ["active", "reserved"])
+      )
+    );
+
+    console.log(`[AUTO-EXPIRE] Found ${snap.docs.length} active bookings`);
+
+    for (const bookingDoc of snap.docs) {
+      const booking       = bookingDoc.data();
+      const [endHour, endMin] = booking.endTime.split(":").map(Number);
+      const endMins       = endHour * 60 + endMin;
+
+      if (currentMins > endMins) {
+        console.log(`[AUTO-EXPIRE] Expiring booking ${booking.bookingId}`);
+
+        await updateDoc(bookingDoc.ref, {
+          bookingStatus: "completed",
+          qrStatus:      "expired",
+        });
+
+        const slotSnap = await getDocs(
+          query(collection(db, "parking_slots"), where("slotId", "==", booking.slotId))
+        );
+
+        if (!slotSnap.empty) {
+          await updateDoc(slotSnap.docs[0].ref, { status: "vacant" });
+          console.log(`[AUTO-EXPIRE] Freed slot ${booking.slotId}`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[AUTO-EXPIRE] Error:", err);
+  }
 };
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -300,68 +434,10 @@ const timeToMins = (t) => {
   const [h, m] = t.split(":").map(Number);
   return h * 60 + m;
 };
-export const scanOvertimeBookings = async () => {
-  const now = new Date();
-  const today = now.toISOString().split("T")[0]; // YYYY-MM-DD
-  const currentMins = now.getHours() * 60 + now.getMinutes();
 
-  // Get all active bookings for today
-  const q = query(
-    collection(db, "bookings"),
-    where("bookingDate", "==", today),
-    where("bookingStatus", "in", ["active", "reserved", "occupied"])
-  );
-
-  const snap = await getDocs(q);
-  const overtimeCases = [];
-
-  for (const bookingDoc of snap.docs) {
-    const booking = bookingDoc.data();
-    const [endHour, endMin] = booking.endTime.split(":").map(Number);
-    const endMins = endHour * 60 + endMin;
-    const overtimeMins = currentMins - endMins;
-
-    if (overtimeMins > 0) {
-      // Calculate penalty
-      let penaltyAmount = 0;
-      let tier = "warning";
-
-      if (overtimeMins > 60)      { penaltyAmount = 200; tier = "high";   }
-      else if (overtimeMins > 30) { penaltyAmount = 100; tier = "medium"; }
-      else if (overtimeMins > 15) { penaltyAmount = 50;  tier = "low";    }
-      else                        { penaltyAmount = 0;   tier = "warning"; }
-
-      // Update booking status
-      await updateDoc(bookingDoc.ref, {
-        bookingStatus:   "overtime",
-        overtimeMinutes: overtimeMins,
-        penaltyAmount:   penaltyAmount,
-      });
-
-      // Write penalty to Firestore
-      const penaltyRef = collection(db, "penalties");
-      await addDoc(penaltyRef, {
-        penaltyId:     `PEN-${bookingDoc.id.slice(0, 6).toUpperCase()}`,
-        bookingId:     booking.bookingId || bookingDoc.id,
-        userId:        booking.userId,
-        slot:          booking.slotLabel,
-        area:          booking.parkingAreaName,
-        overtimeMins:  overtimeMins,
-        penaltyAmount: penaltyAmount,
-        tier:          tier,
-        status:        "pending",
-        createdAt:     new Date().toISOString(),
-      });
-
-      overtimeCases.push({
-        bookingId:     booking.bookingId,
-        slot:          booking.slotLabel,
-        overtimeMins,
-        penaltyAmount,
-        tier,
-      });
-    }
-  }
-
-  return overtimeCases;
+export const isBookingExpired = (booking) => {
+  const now            = new Date();
+  const [year, month, day] = booking.bookingDate.split("-").map(Number);
+  const [hour, min]    = booking.endTime.split(":").map(Number);
+  return now > new Date(year, month - 1, day, hour, min);
 };
